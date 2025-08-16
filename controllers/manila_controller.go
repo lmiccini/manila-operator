@@ -668,7 +668,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	// - %-config configmap holding minimal manila config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfig(ctx, helper, instance, &configVars, serviceLabels, memcached, db)
+	err = r.generateServiceConfig(ctx, helper, instance, &configVars, serviceLabels, memcached, db, transportURL)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -943,6 +943,7 @@ func (r *ManilaReconciler) generateServiceConfig(
 	serviceLabels map[string]string,
 	memcached *memcachedv1.Memcached,
 	db *mariadbv1.Database,
+	transportURL *rabbitmqv1.TransportURL,
 ) error {
 	//
 	// create Secret required for manila input
@@ -1044,6 +1045,11 @@ func (r *ManilaReconciler) generateServiceConfig(
 		} else {
 			templateParameters["NotificationsURL"] = transportURLSecretData
 		}
+	}
+
+	// Quorum queues configuration
+	if transportURL.GetQuorumQueues() {
+		templateParameters["RabbitQuorumQueue"] = true
 	}
 
 	configTemplates := []util.Template{
