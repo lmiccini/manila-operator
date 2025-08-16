@@ -1047,9 +1047,19 @@ func (r *ManilaReconciler) generateServiceConfig(
 		}
 	}
 
-	// Quorum queues configuration
+	// Quorum queues configuration for main RabbitMQ
 	if transportURL.GetQuorumQueues() {
 		templateParameters["RabbitQuorumQueue"] = true
+	}
+
+	// Quorum queues configuration for notifications RabbitMQ (if different)
+	if instance.Status.NotificationsURLSecret != nil &&
+		instance.Spec.RabbitMqClusterName != *instance.Spec.NotificationsBusInstance {
+		// Get the notifications TransportURL to check its quorum queue settings
+		notificationTransportURL, err := r.getNotificationTransportURL(ctx, instance)
+		if err == nil && notificationTransportURL != nil {
+			templateParameters["NotificationsRabbitQuorumQueue"] = notificationTransportURL.GetQuorumQueues()
+		}
 	}
 
 	configTemplates := []util.Template{
@@ -1287,6 +1297,25 @@ func (r *ManilaReconciler) transportURLCreateOrUpdate(
 		return err
 	})
 	return transportURL, op, err
+}
+
+// getNotificationTransportURL retrieves the notification TransportURL if it exists
+func (r *ManilaReconciler) getNotificationTransportURL(ctx context.Context, instance *manilav1beta1.Manila) (*rabbitmqv1.TransportURL, error) {
+	if instance.Spec.NotificationsBusInstance == nil {
+		return nil, nil
+	}
+
+	rmqName := fmt.Sprintf("%s-manila-transport-%s", instance.Name, *instance.Spec.NotificationsBusInstance)
+	transportURL := &rabbitmqv1.TransportURL{}
+	err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      rmqName,
+		Namespace: instance.Namespace,
+	}, transportURL)
+
+	if err != nil {
+		return nil, err
+	}
+	return transportURL, nil
 }
 
 func (r *ManilaReconciler) ensureDB(
