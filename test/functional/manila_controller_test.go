@@ -1955,6 +1955,150 @@ var _ = Describe("Manila controller", func() {
 		})
 	})
 
+	When("TransportURL consumer finalizer is managed", func() {
+		BeforeEach(func() {
+			DeferCleanup(k8sClient.Delete, ctx, CreateManilaMessageBusSecret(manilaTest.Instance.Namespace, manilaTest.RabbitmqSecretName))
+			DeferCleanup(th.DeleteInstance, CreateManila(manilaTest.Instance, GetDefaultManilaSpec(), annotations))
+			DeferCleanup(
+				mariadb.DeleteDBService,
+				mariadb.CreateDBService(
+					manilaTest.Instance.Namespace,
+					GetManila(manilaTest.Instance).Spec.DatabaseInstance,
+					corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 3306}},
+					},
+				),
+			)
+			infra.SimulateTransportURLReady(manilaTest.ManilaTransportURL)
+			DeferCleanup(infra.DeleteMemcached, infra.CreateMemcached(namespace, manilaTest.MemcachedInstance, memcachedSpec))
+			infra.SimulateMemcachedReady(manilaTest.ManilaMemcached)
+			DeferCleanup(keystone.DeleteKeystoneAPI, keystone.CreateKeystoneAPI(manilaTest.Instance.Namespace))
+			mariadb.SimulateMariaDBDatabaseCompleted(manilaTest.ManilaDatabaseName)
+			mariadb.SimulateMariaDBAccountCompleted(manilaTest.ManilaDatabaseAccount)
+			th.SimulateJobSuccess(manilaTest.ManilaDBSync)
+			keystone.SimulateKeystoneServiceReady(manilaTest.Instance)
+			keystone.SimulateKeystoneEndpointReady(manilaTest.ManilaKeystoneEndpoint)
+		})
+
+		It("should add the consumer finalizer to the transport secret", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      manilaTest.RabbitmqSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should remove the consumer finalizer from transport secret on CR deletion", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      manilaTest.RabbitmqSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			th.DeleteInstance(GetManila(manilaTest.Instance))
+
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      manilaTest.RabbitmqSecretName,
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should move the finalizer from the old to the new secret on transport rotation", func() {
+			oldSecretName := manilaTest.RabbitmqSecretName
+
+			// Wait for the consumer finalizer to be added to the old secret
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Get Manila to fully ready state first
+			th.SimulateStatefulSetReplicaReady(manilaTest.ManilaAPI)
+			th.SimulateStatefulSetReplicaReady(manilaTest.ManilaScheduler)
+			th.SimulateStatefulSetReplicaReady(manilaTest.ManilaShares[0])
+			Eventually(func(g Gomega) {
+				m := GetManila(manilaTest.Instance)
+				g.Expect(m.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+				g.Expect(m.Status.TransportURLSecret).To(Equal(oldSecretName))
+			}, timeout, interval).Should(Succeed())
+
+			// Create the new rotated secret with DIFFERENT content
+			newSecretName := "rabbitmq-secret-rotated"
+			newSecret := th.CreateSecret(
+				types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      newSecretName,
+				},
+				map[string][]byte{
+					"transport_url": []byte("rabbit://rotated-user:rotated-pass@rabbitmq/fake"),
+				},
+			)
+			DeferCleanup(k8sClient.Delete, ctx, newSecret)
+
+			// Simulate transport rotation: update TransportURL status with new secret name
+			Eventually(func(g Gomega) {
+				transport := infra.GetTransportURL(manilaTest.ManilaTransportURL)
+				transport.Status.SecretName = newSecretName
+				g.Expect(k8sClient.Status().Update(ctx, transport)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify finalizer is added to the new secret
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      newSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// The old secret's finalizer should NOT be removed yet — sub-CRs
+			// are re-deploying with new credentials and are not ready
+			Consistently(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate sub-CRs becoming ready with the new credentials
+			Eventually(func(g Gomega) {
+				th.SimulateStatefulSetReplicaReady(manilaTest.ManilaAPI)
+				th.SimulateStatefulSetReplicaReady(manilaTest.ManilaScheduler)
+				th.SimulateStatefulSetReplicaReady(manilaTest.ManilaShares[0])
+				// Verify old finalizer is removed
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: manilaTest.Instance.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(manila.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Verify status tracks the new secret
+			Eventually(func(g Gomega) {
+				m := GetManila(manilaTest.Instance)
+				g.Expect(m.Status.TransportURLSecret).To(Equal(newSecretName))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
 	When("ApplicationCredential consumer finalizer is managed", func() {
 		var (
 			acSecretName          string

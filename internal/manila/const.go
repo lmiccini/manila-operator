@@ -84,6 +84,8 @@ const (
 	CustomServiceConfigSecretsFileName = "04-config.conf" // #nosec G101
 	// ACConsumerFinalizer is added to AC secrets that Manila is actively consuming
 	ACConsumerFinalizer = "openstack.org/manila-ac-consumer"
+	// TransportConsumerFinalizer is added to transport URL secrets that Manila is actively consuming
+	TransportConsumerFinalizer = "openstack.org/manila-transport-consumer"
 	// ShortDuration -
 	ShortDuration = time.Duration(5) * time.Second
 	// NormalDuration -

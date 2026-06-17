@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -542,6 +543,7 @@ func (r *ManilaShareReconciler) reconcileNormal(ctx context.Context, instance *m
 	}
 	ss := statefulset.NewStatefulSet(ssDef, manila.ShortDuration)
 
+	var ssData appsv1.StatefulSet
 	ctrlResult, err = ss.CreateOrPatch(ctx, helper)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -553,8 +555,12 @@ func (r *ManilaShareReconciler) reconcileNormal(ctx context.Context, instance *m
 		return ctrlResult, err
 
 	} else if (ctrlResult == ctrl.Result{}) {
-		// Wait until the data in the StatefulSet is for the current generation
-		ssData := ss.GetStatefulSet()
+		// Direct API read to avoid stale informer cache after CreateOrPatch
+		freshSS, getErr := helper.GetKClient().AppsV1().StatefulSets(instance.Namespace).Get(ctx, ssDef.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return ctrl.Result{}, getErr
+		}
+		ssData = *freshSS
 		if ssData.Generation != ssData.Status.ObservedGeneration {
 			ctrlResult = manila.ResultRequeue
 			err = fmt.Errorf("%w: %s", ErrStatefulSetWaiting, ssData.Name)
@@ -567,69 +573,68 @@ func (r *ManilaShareReconciler) reconcileNormal(ctx context.Context, instance *m
 			condition.RequestedReason,
 			condition.SeverityInfo,
 			condition.DeploymentReadyRunningMessage))
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.NetworkAttachmentsReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.NetworkAttachmentsReadyInitMessage))
 		return ctrlResult, err
 	}
 
-	ssData := ss.GetStatefulSet()
-	if ssData.Generation == ssData.Status.ObservedGeneration {
-		instance.Status.ReadyCount = ssData.Status.ReadyReplicas
+	instance.Status.ReadyCount = ssData.Status.ReadyReplicas
 
-		// verify if network attachment matches expectations
-		networkReady := false
-		networkAttachmentStatus := map[string][]string{}
-		if *(instance.Spec.Replicas) > 0 {
-			// verify if network attachment matches expectations
-			networkReady, networkAttachmentStatus, err = nad.VerifyNetworkStatusFromAnnotation(
-				ctx,
-				helper,
-				instance.Spec.NetworkAttachments,
-				serviceLabels,
-				instance.Status.ReadyCount,
-			)
-			if err != nil {
-				nerr := fmt.Errorf("verifying API NetworkAttachments (%s) %w", instance.Spec.NetworkAttachments, err)
-				instance.Status.Conditions.MarkFalse(
-					condition.NetworkAttachmentsReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					condition.NetworkAttachmentsReadyErrorMessage,
-					nerr.Error())
-				return ctrl.Result{}, nerr
-			}
-		} else {
-			networkReady = true
-		}
-
-		instance.Status.NetworkAttachments = networkAttachmentStatus
-		if networkReady {
-			instance.Status.Conditions.MarkTrue(condition.NetworkAttachmentsReadyCondition, condition.NetworkAttachmentsReadyMessage)
-		} else {
-			err := fmt.Errorf("%w: %s", ErrNetworkAttachmentConfig, instance.Spec.NetworkAttachments)
-			instance.Status.Conditions.Set(condition.FalseCondition(
+	networkReady := false
+	networkAttachmentStatus := map[string][]string{}
+	if *(instance.Spec.Replicas) > 0 {
+		networkReady, networkAttachmentStatus, err = nad.VerifyNetworkStatusFromAnnotation(
+			ctx,
+			helper,
+			instance.Spec.NetworkAttachments,
+			serviceLabels,
+			instance.Status.ReadyCount,
+		)
+		if err != nil {
+			nerr := fmt.Errorf("verifying API NetworkAttachments (%s) %w", instance.Spec.NetworkAttachments, err)
+			instance.Status.Conditions.MarkFalse(
 				condition.NetworkAttachmentsReadyCondition,
 				condition.ErrorReason,
 				condition.SeverityWarning,
 				condition.NetworkAttachmentsReadyErrorMessage,
-				err.Error()))
-
-			return ctrl.Result{}, err
+				nerr.Error())
+			return ctrl.Result{}, nerr
 		}
+	} else {
+		networkReady = true
+	}
 
-		if instance.Status.ReadyCount > 0 {
-			instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
-		} else if *instance.Spec.Replicas > 0 {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				condition.DeploymentReadyCondition,
-				condition.RequestedReason,
-				condition.SeverityInfo,
-				condition.DeploymentReadyRunningMessage))
-		} else {
-			instance.Status.Conditions.MarkFalse(
-				condition.DeploymentReadyCondition,
-				condition.NotRequestedReason,
-				condition.SeverityInfo,
-				condition.DeploymentReadyInitMessage)
-		}
+	instance.Status.NetworkAttachments = networkAttachmentStatus
+	if networkReady {
+		instance.Status.Conditions.MarkTrue(condition.NetworkAttachmentsReadyCondition, condition.NetworkAttachmentsReadyMessage)
+	} else {
+		err := fmt.Errorf("%w: %s", ErrNetworkAttachmentConfig, instance.Spec.NetworkAttachments)
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.NetworkAttachmentsReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.NetworkAttachmentsReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, err
+	}
+
+	if instance.Status.ReadyCount > 0 && ssData.Status.UpdatedReplicas >= *instance.Spec.Replicas {
+		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
+	} else if *instance.Spec.Replicas > 0 {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
+	} else {
+		instance.Status.Conditions.MarkFalse(
+			condition.DeploymentReadyCondition,
+			condition.NotRequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyInitMessage)
 	}
 	// create StatefulSet - end
 
