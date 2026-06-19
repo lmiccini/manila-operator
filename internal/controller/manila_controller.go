@@ -913,6 +913,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 
 	// Deploy ManilaShare
 	var shareCondition *condition.Condition
+	var manilaShares []*manilav1beta1.ManilaShare
 	for _, name := range slices.Sorted(maps.Keys(instance.Spec.ManilaShares)) {
 		share := instance.Spec.ManilaShares[name]
 		manilaShare, op, err := r.shareDeploymentCreateOrUpdate(ctx, instance, name, share, serviceLabels, transportURL.Status.SecretName)
@@ -928,6 +929,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 		if op != controllerutil.OperationResultNone {
 			Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(op)))
 		}
+		manilaShares = append(manilaShares, manilaShare)
 
 		if manilaShare.Generation == manilaShare.Status.ObservedGeneration {
 			// Mirror ManilaShare status' ReadyCount to this parent CR
@@ -1016,10 +1018,16 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' successfully", instance.Name))
 
 	// Manage the old transport secret's finalizer and status tracking.
+	// On rotation (old != new), only remove the old secret's finalizer after
+	// all sub-services have fully rolled out with the new credentials.
+	// AllSubConditionIsTrue alone is insufficient because sub-CR ReadyConditions
+	// can remain stale-True during rollouts; we additionally check each
+	// sub-CR's DeploymentReadyCondition which IS set to False during rollouts.
 	isTransportRotation := instance.Status.TransportURLSecret != "" &&
 		instance.Status.TransportURLSecret != transportURL.Status.SecretName
 	if isTransportRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
+		if instance.Status.Conditions.AllSubConditionIsTrue() &&
+			allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares) {
 			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
 				ctx, helper, instance.Namespace,
 				instance.Status.TransportURLSecret,
@@ -1040,7 +1048,8 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 
 	if isRotation {
-		allServicesReady := instance.Status.Conditions.AllSubConditionIsTrue()
+		allServicesReady := instance.Status.Conditions.AllSubConditionIsTrue() &&
+			allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares)
 		if allServicesReady {
 			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, manila.ACConsumerFinalizer); err != nil {
@@ -1582,4 +1591,27 @@ func (r *ManilaReconciler) shareCleanup(
 		return false, hash, err
 	}
 	return cleanJob, hash, nil
+}
+
+// allSubCRsDeploymentReady returns true only when every sub-CR's
+// DeploymentReadyCondition is True. During a StatefulSet rollout the sub-CR
+// controllers set DeploymentReady=False, so this prevents the parent from
+// removing credential finalizers before the rollout completes.
+func allSubCRsDeploymentReady(
+	manilaAPI *manilav1beta1.ManilaAPI,
+	manilaScheduler *manilav1beta1.ManilaScheduler,
+	manilaShares []*manilav1beta1.ManilaShare,
+) bool {
+	if !manilaAPI.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+		return false
+	}
+	if !manilaScheduler.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+		return false
+	}
+	for _, share := range manilaShares {
+		if !share.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+			return false
+		}
+	}
+	return true
 }
