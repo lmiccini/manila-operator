@@ -1603,18 +1603,31 @@ func (r *ManilaReconciler) shareCleanup(
 	return cleanJob, hash, nil
 }
 
+// subCRDeploymentReady returns true when a sub-CR's deployment is either
+// ready (DeploymentReadyCondition=True) or not applicable (replicas=0,
+// indicated by NotRequestedReason). Sub-CRs scaled to zero should not
+// block credential rotation finalizer removal.
+func subCRDeploymentReady(conditions condition.Conditions) bool {
+	if conditions.IsTrue(condition.DeploymentReadyCondition) {
+		return true
+	}
+	c := conditions.Get(condition.DeploymentReadyCondition)
+	return c != nil && c.Reason == condition.NotRequestedReason
+}
+
 // allSubCRsDeploymentReady returns true only when every sub-CR's
-// DeploymentReadyCondition is True. During a StatefulSet rollout the sub-CR
-// controllers set DeploymentReady=False, so this prevents the parent from
-// removing credential finalizers before the rollout completes.
+// deployment is ready or scaled to zero. During a StatefulSet rollout
+// the sub-CR controllers set DeploymentReady=False/Requested, so this
+// prevents the parent from removing credential finalizers before the
+// rollout completes.
 func allSubCRsDeploymentReady(
 	manilaAPI *manilav1beta1.ManilaAPI,
 	manilaScheduler *manilav1beta1.ManilaScheduler,
 	manilaShares []*manilav1beta1.ManilaShare,
 ) bool {
 	log := ctrl.Log.WithName("deployment-ready-debug")
-	apiReady := manilaAPI.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
-	schedulerReady := manilaScheduler.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
+	apiReady := subCRDeploymentReady(manilaAPI.Status.Conditions)
+	schedulerReady := subCRDeploymentReady(manilaScheduler.Status.Conditions)
 	log.Info("DEBUG sub-CR DeploymentReady check",
 		"manilaAPI", apiReady,
 		"manilaScheduler", schedulerReady,
@@ -1638,7 +1651,7 @@ func allSubCRsDeploymentReady(
 		return false
 	}
 	for _, share := range manilaShares {
-		shareReady := share.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
+		shareReady := subCRDeploymentReady(share.Status.Conditions)
 		log.Info("DEBUG share DeploymentReady", "name", share.Name, "ready", shareReady)
 		if !shareReady {
 			shareCond := share.Status.Conditions.Get(condition.DeploymentReadyCondition)
