@@ -22,6 +22,7 @@ import (
 	"maps"
 	"slices"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -927,8 +928,12 @@ func (r *ManilaAPIReconciler) reconcileNormal(ctx context.Context, instance *man
 		return ctrlResult, err
 
 	} else if (ctrlResult == ctrl.Result{}) {
-		// Wait until the data in the StatefulSet is for the current generation
-		ssData = ss.GetStatefulSet()
+		// Direct API read to avoid stale informer cache after CreateOrPatch
+		freshSS, getErr := helper.GetKClient().AppsV1().StatefulSets(instance.Namespace).Get(ctx, ssDef.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return ctrl.Result{}, getErr
+		}
+		ssData = *freshSS
 		if ssData.Generation != ssData.Status.ObservedGeneration {
 			ctrlResult = manila.ResultRequeue
 			err = fmt.Errorf("%w: %s", ErrStatefulSetWaiting, ssData.Name)
