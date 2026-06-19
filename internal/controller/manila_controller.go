@@ -1022,8 +1022,24 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	// secret's finalizer once guardReady is true. We require both
 	// AllSubConditionIsTrue and DeploymentReady on every sub-CR because
 	// ReadyConditions can remain stale-True during rollouts.
-	guardReady := instance.Status.Conditions.AllSubConditionIsTrue() &&
-		allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares)
+	allSubTrue := instance.Status.Conditions.AllSubConditionIsTrue()
+	deploymentsReady := allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares)
+	guardReady := allSubTrue && deploymentsReady
+	Log.Info("DEBUG transport rotation guard",
+		"allSubConditionsTrue", allSubTrue,
+		"deploymentsReady", deploymentsReady,
+		"guardReady", guardReady,
+		"statusTransportURLSecret", instance.Status.TransportURLSecret,
+		"transportURLSecretName", transportURL.Status.SecretName,
+	)
+	if !allSubTrue {
+		for _, c := range instance.Status.Conditions {
+			if c.Type != condition.ReadyCondition && c.Status != "True" {
+				Log.Info("DEBUG Manila sub-condition NOT True",
+					"type", c.Type, "status", c.Status, "reason", c.Reason, "message", c.Message)
+			}
+		}
+	}
 	instance.Status.TransportURLSecret, err = rabbitmqv1.FinalizeTransportSecretRotation(
 		ctx, helper, instance.Namespace,
 		instance.Status.TransportURLSecret,
@@ -1596,14 +1612,39 @@ func allSubCRsDeploymentReady(
 	manilaScheduler *manilav1beta1.ManilaScheduler,
 	manilaShares []*manilav1beta1.ManilaShare,
 ) bool {
-	if !manilaAPI.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+	log := ctrl.Log.WithName("deployment-ready-debug")
+	apiReady := manilaAPI.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
+	schedulerReady := manilaScheduler.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
+	log.Info("DEBUG sub-CR DeploymentReady check",
+		"manilaAPI", apiReady,
+		"manilaScheduler", schedulerReady,
+	)
+	if !apiReady {
+		apiCond := manilaAPI.Status.Conditions.Get(condition.DeploymentReadyCondition)
+		if apiCond != nil {
+			log.Info("DEBUG manilaAPI DeploymentReady detail", "status", apiCond.Status, "reason", apiCond.Reason, "message", apiCond.Message)
+		} else {
+			log.Info("DEBUG manilaAPI DeploymentReady condition NOT FOUND")
+		}
 		return false
 	}
-	if !manilaScheduler.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+	if !schedulerReady {
+		schedCond := manilaScheduler.Status.Conditions.Get(condition.DeploymentReadyCondition)
+		if schedCond != nil {
+			log.Info("DEBUG manilaScheduler DeploymentReady detail", "status", schedCond.Status, "reason", schedCond.Reason, "message", schedCond.Message)
+		} else {
+			log.Info("DEBUG manilaScheduler DeploymentReady condition NOT FOUND")
+		}
 		return false
 	}
 	for _, share := range manilaShares {
-		if !share.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+		shareReady := share.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
+		log.Info("DEBUG share DeploymentReady", "name", share.Name, "ready", shareReady)
+		if !shareReady {
+			shareCond := share.Status.Conditions.Get(condition.DeploymentReadyCondition)
+			if shareCond != nil {
+				log.Info("DEBUG share DeploymentReady detail", "name", share.Name, "status", shareCond.Status, "reason", shareCond.Reason, "message", shareCond.Message)
+			}
 			return false
 		}
 	}
