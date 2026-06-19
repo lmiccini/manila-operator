@@ -1030,13 +1030,6 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 		schedulerOp == controllerutil.OperationResultNone &&
 		allSharesStable
 	guardReady := allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue()
-	Log.Info("DEBUG transport rotation guard",
-		"allSubCRsStable", allSubCRsStable,
-		"allSubConditionsTrue", instance.Status.Conditions.AllSubConditionIsTrue(),
-		"guardReady", guardReady,
-		"statusTransportURLSecret", instance.Status.TransportURLSecret,
-		"transportURLSecretName", transportURL.Status.SecretName,
-	)
 	instance.Status.TransportURLSecret, err = rabbitmqv1.FinalizeTransportSecretRotation(
 		ctx, helper, instance.Namespace,
 		instance.Status.TransportURLSecret,
@@ -1597,4 +1590,3 @@ func (r *ManilaReconciler) shareCleanup(
 	}
 	return cleanJob, hash, nil
 }
-
