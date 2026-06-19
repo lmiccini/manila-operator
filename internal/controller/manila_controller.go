@@ -915,6 +915,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	var shareCondition *condition.Condition
 	var manilaShares []*manilav1beta1.ManilaShare
 	allSharesStable := true
+	waitingShareGenerationMatch := false
 	for _, name := range slices.Sorted(maps.Keys(instance.Spec.ManilaShares)) {
 		share := instance.Spec.ManilaShares[name]
 		manilaShare, shareOp, err := r.shareDeploymentCreateOrUpdate(ctx, instance, name, share, serviceLabels, transportURL.Status.SecretName)
@@ -940,11 +941,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 			}
 			instance.Status.ManilaSharesReadyCounts[name] = manilaShare.Status.ReadyCount
 		} else {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				manilav1beta1.ManilaShareReadyCondition,
-				condition.RequestedReason,
-				condition.SeverityInfo,
-				condition.DeploymentReadyRunningMessage))
+			waitingShareGenerationMatch = true
 		}
 
 		// If this manilaShare is not IsReady, mirror the condition to get the latest step it is in.
@@ -959,6 +956,12 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	if shareCondition != nil {
 		// If there was a Status=False condition, set that as the ManilaShareReadyCondition
 		instance.Status.Conditions.Set(shareCondition)
+	} else if waitingShareGenerationMatch {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			manilav1beta1.ManilaShareReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	} else {
 		// The ManilaShares are ready.
 		// Using "condition.DeploymentReadyMessage" here because that is what gets mirrored
