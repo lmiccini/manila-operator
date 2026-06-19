@@ -1018,27 +1018,21 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' successfully", instance.Name))
 
 	// Manage the old transport secret's finalizer and status tracking.
-	// On rotation (old != new), only remove the old secret's finalizer after
-	// all sub-services have fully rolled out with the new credentials.
-	// AllSubConditionIsTrue alone is insufficient because sub-CR ReadyConditions
-	// can remain stale-True during rollouts; we additionally check each
-	// sub-CR's DeploymentReadyCondition which IS set to False during rollouts.
-	isTransportRotation := instance.Status.TransportURLSecret != "" &&
-		instance.Status.TransportURLSecret != transportURL.Status.SecretName
-	if isTransportRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() &&
-			allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares) {
-			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-				ctx, helper, instance.Namespace,
-				instance.Status.TransportURLSecret,
-				manila.TransportConsumerFinalizer,
-			); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.TransportURLSecret = transportURL.Status.SecretName
-		}
-	} else {
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	// The helper detects rotation (old != new) and only removes the old
+	// secret's finalizer once guardReady is true. We require both
+	// AllSubConditionIsTrue and DeploymentReady on every sub-CR because
+	// ReadyConditions can remain stale-True during rollouts.
+	guardReady := instance.Status.Conditions.AllSubConditionIsTrue() &&
+		allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares)
+	instance.Status.TransportURLSecret, err = rabbitmqv1.FinalizeTransportSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		transportURL.Status.SecretName,
+		manila.TransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Manage the old AC secret's finalizer and status tracking.
