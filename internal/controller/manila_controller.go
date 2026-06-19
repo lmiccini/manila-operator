@@ -81,8 +81,9 @@ func (r *ManilaReconciler) GetScheme() *runtime.Scheme {
 // ManilaReconciler reconciles a Manila object
 type ManilaReconciler struct {
 	client.Client
-	Kclient kubernetes.Interface
-	Scheme  *runtime.Scheme
+	Kclient   kubernetes.Interface
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 // GetLogger returns a logger object with a prefix of "controller.name" and additional controller context fields
@@ -148,6 +149,7 @@ func (r *ManilaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 		Log.Error(err, fmt.Sprintf("could not instantiate helper for instance %s", instance.Name))
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 
 	// initialize status
 	isNewInstance := instance.Status.Conditions == nil
@@ -840,6 +842,9 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	// normal reconcile tasks
 	//
 
+	rotationInProgress := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != transportURL.Status.SecretName
+
 	// deploy manila-api
 	manilaAPI, apiOp, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
@@ -849,6 +854,9 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 			condition.SeverityWarning,
 			manilav1beta1.ManilaAPIReadyErrorMessage,
 			err.Error()))
+		return ctrl.Result{}, err
+	}
+	if err := helper.EnsureFresh(ctx, apiOp, manilaAPI, rotationInProgress); err != nil {
 		return ctrl.Result{}, err
 	}
 	if apiOp != controllerutil.OperationResultNone {
@@ -890,6 +898,9 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 			err.Error()))
 		return ctrl.Result{}, err
 	}
+	if err := helper.EnsureFresh(ctx, schedulerOp, manilaScheduler, rotationInProgress); err != nil {
+		return ctrl.Result{}, err
+	}
 	if schedulerOp != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(schedulerOp)))
 	}
@@ -926,6 +937,9 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 				condition.SeverityWarning,
 				manilav1beta1.ManilaShareReadyErrorMessage,
 				err.Error()))
+			return ctrl.Result{}, err
+		}
+		if err := helper.EnsureFresh(ctx, shareOp, manilaShare, rotationInProgress); err != nil {
 			return ctrl.Result{}, err
 		}
 		if shareOp != controllerutil.OperationResultNone {

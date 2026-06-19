@@ -260,9 +260,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ManilaReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Kclient: kclient,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Kclient:   kclient,
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(context.Background(), mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Manila")
 		os.Exit(1)
