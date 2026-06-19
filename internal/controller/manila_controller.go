@@ -841,7 +841,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	//
 
 	// deploy manila-api
-	manilaAPI, op, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
+	manilaAPI, apiOp, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			manilav1beta1.ManilaAPIReadyCondition,
@@ -851,8 +851,8 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(op)))
+	if apiOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(apiOp)))
 	}
 
 	if manilaAPI.Generation == manilaAPI.Status.ObservedGeneration {
@@ -880,7 +880,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	}
 
 	// Deploy ManilaScheduler
-	manilaScheduler, op, err := r.schedulerDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
+	manilaScheduler, schedulerOp, err := r.schedulerDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			manilav1beta1.ManilaSchedulerReadyCondition,
@@ -890,8 +890,8 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(op)))
+	if schedulerOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(schedulerOp)))
 	}
 
 	if manilaScheduler.Generation == manilaScheduler.Status.ObservedGeneration {
@@ -914,9 +914,10 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	// Deploy ManilaShare
 	var shareCondition *condition.Condition
 	var manilaShares []*manilav1beta1.ManilaShare
+	allSharesStable := true
 	for _, name := range slices.Sorted(maps.Keys(instance.Spec.ManilaShares)) {
 		share := instance.Spec.ManilaShares[name]
-		manilaShare, op, err := r.shareDeploymentCreateOrUpdate(ctx, instance, name, share, serviceLabels, transportURL.Status.SecretName)
+		manilaShare, shareOp, err := r.shareDeploymentCreateOrUpdate(ctx, instance, name, share, serviceLabels, transportURL.Status.SecretName)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				manilav1beta1.ManilaShareReadyCondition,
@@ -926,8 +927,9 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 				err.Error()))
 			return ctrl.Result{}, err
 		}
-		if op != controllerutil.OperationResultNone {
-			Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(op)))
+		if shareOp != controllerutil.OperationResultNone {
+			Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", instance.Name, string(shareOp)))
+			allSharesStable = false
 		}
 		manilaShares = append(manilaShares, manilaShare)
 
@@ -1019,27 +1021,22 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 
 	// Manage the old transport secret's finalizer and status tracking.
 	// The helper detects rotation (old != new) and only removes the old
-	// secret's finalizer once guardReady is true. We require both
-	// AllSubConditionIsTrue and DeploymentReady on every sub-CR because
-	// ReadyConditions can remain stale-True during rollouts.
-	allSubTrue := instance.Status.Conditions.AllSubConditionIsTrue()
-	deploymentsReady := allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares)
-	guardReady := allSubTrue && deploymentsReady
+	// secret's finalizer once guardReady is true. We require all sub-CR
+	// specs to be stable (no pending updates from CreateOrPatch) because
+	// the generation bump from TransportURLSecret is consumed by sub-CR
+	// controllers almost instantly, making AllSubConditionIsTrue
+	// unreliable on its own.
+	allSubCRsStable := apiOp == controllerutil.OperationResultNone &&
+		schedulerOp == controllerutil.OperationResultNone &&
+		allSharesStable
+	guardReady := allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue()
 	Log.Info("DEBUG transport rotation guard",
-		"allSubConditionsTrue", allSubTrue,
-		"deploymentsReady", deploymentsReady,
+		"allSubCRsStable", allSubCRsStable,
+		"allSubConditionsTrue", instance.Status.Conditions.AllSubConditionIsTrue(),
 		"guardReady", guardReady,
 		"statusTransportURLSecret", instance.Status.TransportURLSecret,
 		"transportURLSecretName", transportURL.Status.SecretName,
 	)
-	if !allSubTrue {
-		for _, c := range instance.Status.Conditions {
-			if c.Type != condition.ReadyCondition && c.Status != "True" {
-				Log.Info("DEBUG Manila sub-condition NOT True",
-					"type", c.Type, "status", c.Status, "reason", c.Reason, "message", c.Message)
-			}
-		}
-	}
 	instance.Status.TransportURLSecret, err = rabbitmqv1.FinalizeTransportSecretRotation(
 		ctx, helper, instance.Namespace,
 		instance.Status.TransportURLSecret,
@@ -1058,9 +1055,7 @@ func (r *ManilaReconciler) reconcileNormal(ctx context.Context, instance *manila
 	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 
 	if isRotation {
-		allServicesReady := instance.Status.Conditions.AllSubConditionIsTrue() &&
-			allSubCRsDeploymentReady(manilaAPI, manilaScheduler, manilaShares)
-		if allServicesReady {
+		if guardReady {
 			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, manila.ACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
@@ -1603,63 +1598,3 @@ func (r *ManilaReconciler) shareCleanup(
 	return cleanJob, hash, nil
 }
 
-// subCRDeploymentReady returns true when a sub-CR's deployment is either
-// ready (DeploymentReadyCondition=True) or not applicable (replicas=0,
-// indicated by NotRequestedReason). Sub-CRs scaled to zero should not
-// block credential rotation finalizer removal.
-func subCRDeploymentReady(conditions condition.Conditions) bool {
-	if conditions.IsTrue(condition.DeploymentReadyCondition) {
-		return true
-	}
-	c := conditions.Get(condition.DeploymentReadyCondition)
-	return c != nil && c.Reason == condition.NotRequestedReason
-}
-
-// allSubCRsDeploymentReady returns true only when every sub-CR's
-// deployment is ready or scaled to zero. During a StatefulSet rollout
-// the sub-CR controllers set DeploymentReady=False/Requested, so this
-// prevents the parent from removing credential finalizers before the
-// rollout completes.
-func allSubCRsDeploymentReady(
-	manilaAPI *manilav1beta1.ManilaAPI,
-	manilaScheduler *manilav1beta1.ManilaScheduler,
-	manilaShares []*manilav1beta1.ManilaShare,
-) bool {
-	log := ctrl.Log.WithName("deployment-ready-debug")
-	apiReady := subCRDeploymentReady(manilaAPI.Status.Conditions)
-	schedulerReady := subCRDeploymentReady(manilaScheduler.Status.Conditions)
-	log.Info("DEBUG sub-CR DeploymentReady check",
-		"manilaAPI", apiReady,
-		"manilaScheduler", schedulerReady,
-	)
-	if !apiReady {
-		apiCond := manilaAPI.Status.Conditions.Get(condition.DeploymentReadyCondition)
-		if apiCond != nil {
-			log.Info("DEBUG manilaAPI DeploymentReady detail", "status", apiCond.Status, "reason", apiCond.Reason, "message", apiCond.Message)
-		} else {
-			log.Info("DEBUG manilaAPI DeploymentReady condition NOT FOUND")
-		}
-		return false
-	}
-	if !schedulerReady {
-		schedCond := manilaScheduler.Status.Conditions.Get(condition.DeploymentReadyCondition)
-		if schedCond != nil {
-			log.Info("DEBUG manilaScheduler DeploymentReady detail", "status", schedCond.Status, "reason", schedCond.Reason, "message", schedCond.Message)
-		} else {
-			log.Info("DEBUG manilaScheduler DeploymentReady condition NOT FOUND")
-		}
-		return false
-	}
-	for _, share := range manilaShares {
-		shareReady := subCRDeploymentReady(share.Status.Conditions)
-		log.Info("DEBUG share DeploymentReady", "name", share.Name, "ready", shareReady)
-		if !shareReady {
-			shareCond := share.Status.Conditions.Get(condition.DeploymentReadyCondition)
-			if shareCond != nil {
-				log.Info("DEBUG share DeploymentReady detail", "name", share.Name, "status", shareCond.Status, "reason", shareCond.Reason, "message", shareCond.Message)
-			}
-			return false
-		}
-	}
-	return true
-}
